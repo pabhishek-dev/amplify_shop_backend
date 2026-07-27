@@ -9,8 +9,9 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel
 import asyncio
 import json
-from bson import json_util # Helps serialize MongoDB ObjectIds to JSON
-from sse_starlette.sse import EventSourceResponse
+from bson import json_util
+from fastapi import FastAPI
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 # Load variables from .env file locally
 load_dotenv()
@@ -198,43 +199,74 @@ async def delete_products_bulk(payload: BulkDeleteSchema):
 @app.get("/api/product/stream")
 async def stream_products():
     async def event_generator():
-        pipeline = [{"$match": {"operationType": {"$in": ["insert", "update", "delete"]}}}]
-        
         try:
-            async with products_col.watch(pipeline, full_document="updateLookup") as stream:
-                print("SSE Client connected.")
-                
-                while True:
-                    change = await stream.try_next()
-                    
-                    if change is not None:
-                        operation = change["operationType"]
-                        doc = json.loads(json_util.dumps(change.get("fullDocument", {})))
-                        
-                        # Structured JSON payload matching your Android model
-                        payload = {
-                            "action": operation, # e.g. "insert", "update", "delete"
-                            "product": doc if operation != "delete" else None,
-                            "productId": doc.get("id") if operation != "delete" else change["documentKey"].get("id")
-                        }
-                        
-                        # Standard JSON data field
-                        yield {
-                            "event": "product_update",
-                            "data": json.dumps(payload)
-                        }
-                    else:
-                        # Yield a raw SSE comment for keep-alive!
-                        # sse-starlette outputs comment lines starting with ':' when comment is passed
-                        yield {
-                            "comment": "ping"
-                        }
-                        await asyncio.sleep(15)
-                        
+            # ==========================================================
+            # STEP 1: FETCH AND SEND INITIAL DATA SNAPSHOT
+            # ==========================================================
+            # Fetch all existing products from MongoDB
+            cursor = products_col.find({}, {"_id": 0})
+            initial_products = await cursor.to_list(length=1000)
+
+            # Package into an initial JSON payload
+            initial_payload = {
+                "action": "initial",
+                "products": json.loads(json_util.dumps(initial_products)),
+            }
+
+            # Yield the initial full dataset to the client
+            yield {
+                "event": "product_update",
+                "data": json.dumps(initial_payload),
+            }
+
+            print("Initial product list sent to SSE client.")
+
+            # ==========================================================
+            # STEP 2: LISTEN FOR LIVE MONGO CHANGE STREAMS
+            # ==========================================================
+            pipeline = [
+                {
+                    "$match": {
+                        "operationType": {"$in": ["insert", "update", "delete"]}
+                    }
+                }
+            ]
+
+            async with products_col.watch(
+                pipeline, full_document="updateLookup"
+            ) as stream:
+                print("SSE Client connected to live stream.")
+
+                async for change in stream:
+                    operation = change["operationType"]
+                    doc = json.loads(
+                        json_util.dumps(change.get("fullDocument", {}))
+                    )
+
+                    # Send continuous updates
+                    update_payload = {
+                        "action": operation,  # "insert", "update", or "delete"
+                        "product": doc if operation != "delete" else None,
+                        "productId": doc.get("id")
+                        if operation != "delete"
+                        else change["documentKey"].get("id"),
+                    }
+
+                    yield {
+                        "event": "product_update",
+                        "data": json.dumps(update_payload),
+                    }
+
         except asyncio.CancelledError:
             print("SSE Client disconnected.")
-            
-    return EventSourceResponse(event_generator())
+
+    return EventSourceResponse(
+        event_generator(),
+        ping=15,
+        ping_message_factory=lambda: ServerSentEvent(
+            **{"comment": "keep-alive"}
+        ),
+    )
 
 # Run handler for local execution and cloud dynamic porting
 if __name__ == "__main__":
