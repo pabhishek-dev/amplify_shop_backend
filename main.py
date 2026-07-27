@@ -7,6 +7,10 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 from pydantic import BaseModel
+import asyncio
+import json
+from bson import json_util # Helps serialize MongoDB ObjectIds to JSON
+from sse_starlette.sse import EventSourceResponse
 
 # Load variables from .env file locally
 load_dotenv()
@@ -187,6 +191,62 @@ async def delete_products_bulk(payload: BulkDeleteSchema):
     return {
         "message": f"Successfully deleted {result.deleted_count} products"
     }
+
+# ==========================================
+# 7. REAL-TIME PRODUCTS STREAM (SSE)
+# ==========================================
+@app.get("/api/product/stream")
+async def stream_products():
+    """
+    Establishes an SSE connection. Listens to MongoDB Change Streams
+    and pushes updates to the client in real-time.
+    """
+    async def event_generator():
+        # Pipeline to watch for specific operations (insert, update, delete)
+        pipeline = [{"$match": {"operationType": {"$in": ["insert", "update", "delete"]}}}]
+        
+        try:
+            # full_document="updateLookup" fetches the whole document even on updates
+            async with products_col.watch(pipeline, full_document="updateLookup") as stream:
+                print("SSE Client connected to MongoDB Change Stream.")
+                
+                # We use a while loop with a timeout to allow the server to send periodic "ping" 
+                # events. This prevents Render/Load Balancers from killing idle connections.
+                while True:
+                    # Wait for a database change, or timeout after 15 seconds to send a keep-alive ping
+                    change = await stream.try_next()
+                    
+                    if change is not None:
+                        # A real database change happened!
+                        operation = change["operationType"]
+                        
+                        # Use bson.json_util.dumps to safely convert MongoDB ObjectIds to JSON strings
+                        doc = json.loads(json_util.dumps(change.get("fullDocument", {})))
+                        
+                        # Prepare payload based on operation
+                        payload = {
+                            "operation": operation,
+                            "product_id": doc.get("id") if operation != "delete" else change["documentKey"].get("id"),
+                            "data": doc if operation != "delete" else None
+                        }
+                        
+                        # Yield the event to the client
+                        yield {
+                            "event": "product_update",
+                            "data": json.dumps(payload)
+                        }
+                    else:
+                        # No changes happened in this tick. Send a ping to keep connection alive.
+                        yield {
+                            "event": "ping",
+                            "data": "keep-alive"
+                        }
+                        await asyncio.sleep(15)
+                        
+        except asyncio.CancelledError:
+            print("SSE Client disconnected.")
+            
+    return EventSourceResponse(event_generator())
 
 # Run handler for local execution and cloud dynamic porting
 if __name__ == "__main__":
